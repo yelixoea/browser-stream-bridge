@@ -1,19 +1,18 @@
-import { createServer } from 'http'
+import { createServer, IncomingMessage, ServerResponse } from 'http'
 import { chromium, Browser, Page } from 'playwright'
 import { spawn, ChildProcess } from 'child_process'
 import fs from 'fs/promises'
+import { logger } from './logger'
 
 /* ================== CONFIG ================== */
+
+const PAGE_BLOCK_LIST_FILE = 'assets/page_block_list.txt'
+const PAGE_PRELOAD_FILE = 'assets/page_preload.js'
 
 const SERVER_IP = process.env.SERVER_IP || '127.0.0.1'
 const SERVER_PORT = Number(process.env.SERVER_PORT || 3001)
 
-const GO2RTC_IP = process.env.GO2RTC_IP || '127.0.0.1'
-const GO2RTC_API_PORT = 1984
-const RTSP_PORT = 8554
-
-const PAGE_BLOCK_LIST_FILE = 'assets/page_block_list.txt'
-const PAGE_PRELOAD_FILE = 'assets/page_preload.js'
+const HLS_DIR = process.env.HLS_DIR || './hls'
 
 const VIDEO_BITRATE = Number(process.env.VIDEO_BITRATE || '6000000')
 
@@ -23,6 +22,7 @@ type StreamContext = {
   id: string
   page: Page
   ffmpeg: ChildProcess
+  lastVisit: number
 }
 
 /* ================== GLOBAL STATE ================== */
@@ -31,8 +31,7 @@ let browser: Browser
 let pageBlockList: RegExp[] = []
 let pagePreloadJs = ''
 
-const streams = new Map<string, StreamContext>()
-let cleanupTimer: NodeJS.Timeout
+const streams = new Map<string, StreamContext | null>()
 
 /* ================== HTTP SERVER ================== */
 
@@ -40,54 +39,76 @@ function startHttpServer() {
   const server = createServer(async (req, res) => {
     try {
       const url = new URL(req.url || '', 'http://localhost')
-      if (url.pathname !== '/api/stream') {
+
+      if (url.pathname.startsWith('/hls/')) {
+        return handleHlsRequest(url, res)
+      } else if (url.pathname === '/api/stream') {
+        return handleApiStreamRequest(url, res)
+      } else {
         res.writeHead(404)
         res.end('Not Found')
         return
       }
-
-      const pageUrl = url.searchParams.get('url')
-      if (!pageUrl) {
-        res.writeHead(400)
-        res.end('Missing url parameter')
-        return
-      }
-
-      const id = `stream_${hash(pageUrl)}`
-
-      // reuse existing stream
-      if (streams.has(id)) {
-        console.log(`[+] reuse stream ${id}`)
-        cleanupTimer?.refresh()
-        res.writeHead(200)
-        res.end(`rtsp://${SERVER_IP}:${RTSP_PORT}/${id}`)
-        return
-      }
-
-      console.log(`[+] create stream ${id}`)
-      streams.set(id, null as any) // placeholder
-      const ctx = await createStreamContext(id, pageUrl)
-      cleanupTimer?.refresh()
-      streams.set(id, ctx)
-
-      res.writeHead(200)
-      res.end(`rtsp://${SERVER_IP}:${RTSP_PORT}/${id}`)
     } catch (err) {
-      console.error('[HTTP]', err)
+      logger.error('HTTP', 'request failed', err)
       res.writeHead(500)
       res.end('Internal Server Error')
     }
   })
 
   server.listen(SERVER_PORT, '0.0.0.0', () => {
-    console.log(`HTTP server listening: http://${SERVER_IP}:${SERVER_PORT}/api/stream?url=...`)
+    logger.info('HTTP', `listening: http://${SERVER_IP}:${SERVER_PORT}/api/stream?url=...`)
   })
+}
+
+async function handleHlsRequest(url: URL, res: ServerResponse<IncomingMessage>) {
+  const filePath = `.${url.pathname}`
+  try {
+    const data = await fs.readFile(filePath)
+    res.writeHead(200)
+    res.end(data)
+  } catch {
+    res.writeHead(404)
+    res.end('Not Found')
+  }
+  return
+}
+
+async function handleApiStreamRequest(url: URL, res: ServerResponse<IncomingMessage>) {
+  const pageUrl = url.searchParams.get('url')
+  if (!pageUrl) {
+    res.writeHead(400)
+    res.end('Missing url parameter')
+    return
+  }
+
+  const id = `stream_${hash(pageUrl)}`
+
+  if (streams.has(id)) {
+    await waitStreamReady(id)
+    if (streams.get(id) !== null) {
+      streams.get(id)!.lastVisit = Date.now()
+    }
+
+    res.writeHead(200)
+    res.end(await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`))
+    return
+  }
+
+  logger.info('STREAM', `[+] create stream ${id}`, { pageUrl })
+  streams.set(id, null)
+
+  const ctx = await createStreamContext(id, pageUrl)
+  streams.set(id, ctx)
+
+  res.writeHead(200)
+  res.end(await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`))
 }
 
 /* ================== STREAM CONTEXT ================== */
 
 async function createStreamContext(id: string, pageUrl: string): Promise<StreamContext> {
-  await createGo2rtcStream(id)
+  await createStream(id)
 
   const page = await browser.newPage({
     viewport: { width: 1920, height: 1080 },
@@ -106,13 +127,13 @@ async function createStreamContext(id: string, pageUrl: string): Promise<StreamC
   const ffmpeg = spawnFFmpeg(id)
 
   page.on('close', () => {
-    console.log(`[-] page closed ${id}`)
+    logger.info('STREAM', `[-] page closed ${id}`)
     ffmpeg.kill('SIGINT')
     streams.delete(id)
   })
 
   ffmpeg.on('exit', () => {
-    console.log(`[-] ffmpeg exit ${id}`)
+    logger.info('STREAM', `[-] ffmpeg exit ${id}`)
     page.close().catch(() => { })
     streams.delete(id)
   })
@@ -135,12 +156,13 @@ async function createStreamContext(id: string, pageUrl: string): Promise<StreamC
     { timeout: 30_000 }
   )
 
-  await waitGo2rtcReady(id)
+  await waitStreamReady(id)
 
   return {
     id,
     page,
     ffmpeg,
+    lastVisit: Date.now(),
   }
 }
 
@@ -157,60 +179,52 @@ function spawnFFmpeg(id: string) {
       '-c:v', 'copy',
       '-c:a', 'aac',
       '-b:a', '96k',
-      '-f', 'rtsp',
-      '-rtsp_transport', 'tcp',
-      `rtsp://127.0.0.1:${RTSP_PORT}/${id}`,
+      '-f', 'hls',
+      '-hls_time', '1',
+      '-hls_list_size', '5',
+      '-hls_flags', 'delete_segments+append_list',
+      '-hls_base_url', `http://${SERVER_IP}:${SERVER_PORT}/hls/${id}/`,
+      `${HLS_DIR}/${id}/live.m3u8`
     ],
     { stdio: ['pipe', 'inherit', 'inherit'] }
   )
 }
 
-/* ================== GO2RTC ================== */
+/* ================== STREAM ================== */
 
-async function createGo2rtcStream(id: string) {
-  await fetch(
-    `http://${GO2RTC_IP}:${GO2RTC_API_PORT}/api/streams?name=${id}&src=rtsp://:${RTSP_PORT}/${id}`,
-    { method: 'PUT' }
-  )
+async function createStream(id: string) {
+  await fs.rm(`${HLS_DIR}/${id}`, { recursive: true, force: true })
+  await fs.mkdir(`${HLS_DIR}/${id}`, { recursive: true })
 }
 
-async function waitGo2rtcReady(id: string) {
+async function waitStreamReady(id: string) {
   const start = Date.now()
   while (Date.now() - start < 30_000) {
     try {
-      const json = await fetch(
-        `http://${GO2RTC_IP}:${GO2RTC_API_PORT}/api/streams`
-      ).then(r => r.json())
-
-      if (json[id]?.producers?.length > 1) return
+      const files = await fs.readdir(`${HLS_DIR}/${id}`).catch(() => [] as string[])
+      if (files.length >= 3 && files.includes('live.m3u8')) return
     } catch { }
-    await delay(200)
+    await delay(100)
   }
-  throw new Error('go2rtc stream not ready')
+  throw new Error('stream not ready')
 }
 
 /* ================== CLEANUP ================== */
 
 function startCleanupTimer() {
-  clearInterval(cleanupTimer)
-  cleanupTimer = setInterval(async () => {
+  setInterval(async () => {
     try {
-      const json = await fetch(`http://${GO2RTC_IP}:1984/api/streams`).then(res => res.json())
-      const noConsumersStreams = Object.entries(json).filter(([_name, info]) => {
-        return (!(info as any).consumers || (info as any).consumers.length === 0)
-      })
-
-      for (const [name, _info] of noConsumersStreams) {
-        if (streams.has(name) && streams.get(name) !== null) {
-          console.log(`[-] cleanup stream ${name}`)
-          const ctx = streams.get(name)!
+      const now = Date.now()
+      for (const [name, ctx] of streams.entries()) {
+        if (ctx !== null && now - ctx.lastVisit > 10_000) {
+          logger.info('STREAM', `[-] cleanup stream ${name}`)
           ctx.ffmpeg.kill('SIGINT')
           await ctx.page.close().catch(() => { })
           streams.delete(name)
         }
       }
     } catch (err) {
-      console.error('[CLEANUP] failed to fetch go2rtc streams', err)
+      logger.error('CLEANUP', 'failed to cleanup streams', err)
     }
   }, 10_000)
 }
@@ -256,9 +270,17 @@ async function launchBrowser() {
   })
 }
 
+function logConfig() {
+  logger.info('CONFIG', `SERVER_IP: ${SERVER_IP}`)
+  logger.info('CONFIG', `SERVER_PORT: ${SERVER_PORT}`)
+  logger.info('CONFIG', `HLS_DIR: ${HLS_DIR}`)
+  logger.info('CONFIG', `VIDEO_BITRATE: ${VIDEO_BITRATE}`)
+}
+
 /* ================== MAIN ================== */
 
 async function main() {
+  logConfig()
   await loadAssets()
   browser = await launchBrowser()
   startHttpServer()
@@ -266,16 +288,18 @@ async function main() {
 }
 
 process.on('SIGINT', async () => {
-  console.log('shutdown...')
+  logger.info('SYSTEM', 'shutdown...')
   for (const ctx of streams.values()) {
-    ctx.ffmpeg.kill('SIGINT')
-    await ctx.page.close().catch(() => { })
+    if (ctx !== null) {
+      ctx.ffmpeg.kill('SIGINT')
+      await ctx.page.close().catch(() => { })
+    }
   }
   await browser.close()
   process.exit(0)
 })
 
 main().catch(err => {
-  console.error(err)
+  logger.error('SYSTEM', 'uncaught error', err)
   process.exit(1)
 })
