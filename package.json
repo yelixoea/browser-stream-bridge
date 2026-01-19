@@ -2,7 +2,7 @@
   "name": "browser-stream-bridge",
   "type": "module",
   "bin": {
-    "browser-stream-bridge": "dist/index.js"
+    "browser-stream-bridge": "dist/index.mjs"
   },
   "scripts": {
     "dev": "tsx src/index.ts",

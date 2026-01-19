@@ -9,6 +9,8 @@ import { logger } from './logger'
 const PAGE_BLOCK_LIST_FILE = 'assets/page_block_list.txt'
 const PAGE_PRELOAD_FILE = 'assets/page_preload.js'
 
+const FFMPEG_PATH = process.env.FFMPEG_PATH || 'ffmpeg'
+
 const SERVER_IP = process.env.SERVER_IP || '127.0.0.1'
 const SERVER_PORT = Number(process.env.SERVER_PORT || 3001)
 
@@ -41,13 +43,12 @@ function startHttpServer() {
       const url = new URL(req.url || '', 'http://localhost')
 
       if (url.pathname.startsWith('/hls/')) {
-        return handleHlsRequest(url, res)
+        await handleHlsRequest(url, res)
       } else if (url.pathname === '/api/stream') {
-        return handleApiStreamRequest(url, res)
+        await handleApiStreamRequest(url, res)
       } else {
         res.writeHead(404)
         res.end('Not Found')
-        return
       }
     } catch (err) {
       logger.error('HTTP', 'request failed', err)
@@ -65,7 +66,13 @@ async function handleHlsRequest(url: URL, res: ServerResponse<IncomingMessage>) 
   const filePath = `.${url.pathname}`
   try {
     const data = await fs.readFile(filePath)
-    res.writeHead(200)
+    res.writeHead(200, {
+      'Content-Type': url.pathname.endsWith('.m3u8')
+        ? 'application/vnd.apple.mpegurl'
+        : 'video/mp2t',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*',
+    })
     res.end(data)
   } catch {
     res.writeHead(404)
@@ -90,8 +97,14 @@ async function handleApiStreamRequest(url: URL, res: ServerResponse<IncomingMess
       streams.get(id)!.lastVisit = Date.now()
     }
 
-    res.writeHead(200)
-    res.end(await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`))
+    const data = await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`)
+    res.writeHead(200, {
+      'Content-Type': 'application/vnd.apple.mpegurl',
+      'Cache-Control': 'no-cache',
+      'Access-Control-Allow-Origin': '*',
+      'Content-Length': data.length.toString(),
+    })
+    res.end(data)
     return
   }
 
@@ -101,8 +114,14 @@ async function handleApiStreamRequest(url: URL, res: ServerResponse<IncomingMess
   const ctx = await createStreamContext(id, pageUrl)
   streams.set(id, ctx)
 
-  res.writeHead(200)
-  res.end(await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`))
+  const data = await fs.readFile(`${HLS_DIR}/${id}/live.m3u8`)
+  res.writeHead(200, {
+    'Content-Type': 'application/vnd.apple.mpegurl',
+    'Cache-Control': 'no-cache',
+    'Access-Control-Allow-Origin': '*',
+    'Content-Length': data.length.toString(),
+  })
+  res.end(data)
 }
 
 /* ================== STREAM CONTEXT ================== */
@@ -170,7 +189,7 @@ async function createStreamContext(id: string, pageUrl: string): Promise<StreamC
 
 function spawnFFmpeg(id: string) {
   return spawn(
-    'ffmpeg',
+    FFMPEG_PATH,
     [
       '-loglevel', 'error',
       '-i', 'pipe:0',
@@ -271,6 +290,8 @@ async function launchBrowser() {
 }
 
 function logConfig() {
+  logger.info('CONFIG', `PLAYWRIGHT_BROWSERS_PATH: ${process.env.PLAYWRIGHT_BROWSERS_PATH || 'default'}`)
+  logger.info('CONFIG', `FFMPEG_PATH: ${FFMPEG_PATH}`)
   logger.info('CONFIG', `SERVER_IP: ${SERVER_IP}`)
   logger.info('CONFIG', `SERVER_PORT: ${SERVER_PORT}`)
   logger.info('CONFIG', `HLS_DIR: ${HLS_DIR}`)
