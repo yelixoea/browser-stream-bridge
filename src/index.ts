@@ -33,6 +33,7 @@ let browser: Browser
 let pageBlockList: RegExp[] = []
 let pagePreloadJs = ''
 
+const assetsCache = new Map<string, Buffer>()
 const streams = new Map<string, StreamContext | null>()
 
 /* ================== HTTP SERVER ================== */
@@ -133,14 +134,34 @@ async function createStreamContext(id: string, pageUrl: string): Promise<StreamC
     viewport: { width: 1920, height: 1080 },
   })
 
-  await page.route('**/*', route => {
-    const reqUrl = route.request().url()
+  await page.route('**/*', (route, req) => {
+    const reqUrl = req.url()
     for (const rule of pageBlockList) {
       if (rule.test(reqUrl)) {
         return route.fulfill({ status: 200, body: '' })
       }
     }
+
+    const cache = assetsCache.get(reqUrl)
+    if (cache) {
+      return route.fulfill({ body: cache })
+    }
+
     route.continue()
+  })
+
+  await page.route('**/*{.js,.css}', (route, req) => {
+    req.response()
+      .then(async (resp) => {
+        if (resp && !assetsCache.get(resp.url())) {
+          try {
+            assetsCache.set(resp.url(), await resp.body())
+          }
+          catch { }
+        }
+      })
+
+    route.fallback()
   })
 
   const ffmpeg = spawnFFmpeg(id)
