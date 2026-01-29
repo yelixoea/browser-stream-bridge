@@ -1,5 +1,5 @@
 import { createServer, IncomingMessage, ServerResponse } from 'http'
-import { chromium, Browser, Page } from 'playwright'
+import { chromium, Browser, Page, BrowserContext } from 'playwright'
 import { spawn, ChildProcess } from 'child_process'
 import fs from 'fs/promises'
 import { logger } from './logger'
@@ -30,6 +30,7 @@ type StreamContext = {
 /* ================== GLOBAL STATE ================== */
 
 let browser: Browser
+let browserContext: BrowserContext
 let pageBlockList: RegExp[] = []
 let pagePreloadJs = ''
 
@@ -130,40 +131,7 @@ async function handleApiStreamRequest(url: URL, res: ServerResponse<IncomingMess
 async function createStreamContext(id: string, pageUrl: string): Promise<StreamContext> {
   await createStream(id)
 
-  const page = await browser.newPage({
-    viewport: { width: 1920, height: 1080 },
-  })
-
-  await page.route('**/*', (route, req) => {
-    const reqUrl = req.url()
-    for (const rule of pageBlockList) {
-      if (rule.test(reqUrl)) {
-        return route.fulfill({ status: 200, body: '' })
-      }
-    }
-
-    const cache = assetsCache.get(reqUrl)
-    if (cache) {
-      return route.fulfill({ body: cache })
-    }
-
-    route.continue()
-  })
-
-  await page.route('**/*{.js,.css}', (route, req) => {
-    req.response()
-      .then(async (resp) => {
-        if (resp && !assetsCache.get(resp.url())) {
-          try {
-            assetsCache.set(resp.url(), await resp.body())
-          }
-          catch { }
-        }
-      })
-
-    route.fallback()
-  })
-
+  const page = await browserContext.newPage()
   const ffmpeg = spawnFFmpeg(id)
 
   page.on('close', () => {
@@ -189,14 +157,23 @@ async function createStreamContext(id: string, pageUrl: string): Promise<StreamC
     (window as any).__VIDEO_BITRATE = bitrate
   }, VIDEO_BITRATE)
   await page.addInitScript(pagePreloadJs)
+
   await page.goto(pageUrl, { waitUntil: 'domcontentloaded' })
+
+  await page.waitForFunction(
+    () => (window as any).__video_ready === true,
+    { timeout: 30_000 }
+  )
+  logger.info('STREAM', `[=] video ready ${id}`)
 
   await page.waitForFunction(
     () => (window as any).__media_capture_ready === true,
     { timeout: 30_000 }
   )
+  logger.info('STREAM', `[=] media capture ready ${id}`)
 
   await waitStreamReady(id)
+  logger.info('STREAM', `[=] stream ready ${id}`)
 
   return {
     id,
@@ -294,8 +271,8 @@ async function loadAssets() {
   pagePreloadJs = await fs.readFile(PAGE_PRELOAD_FILE, 'utf-8')
 }
 
-async function launchBrowser() {
-  return chromium.launch({
+async function loadBrowser() {
+  browser = await chromium.launch({
     headless: true,
     args: [
       '--no-sandbox',
@@ -307,6 +284,43 @@ async function launchBrowser() {
       '--enable-features=WebRTC-H264HighProfile,WebCodecs',
       '--disable-web-security',
     ],
+  })
+
+  browserContext = await browser.newContext({
+    acceptDownloads: false,
+    ignoreHTTPSErrors: true,
+    viewport: { width: 1920, height: 1080 },
+    userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Edg/144.0.0.0',
+  })
+
+  await browserContext.route('**/*', (route, req) => {
+    const reqUrl = req.url()
+    for (const rule of pageBlockList) {
+      if (rule.test(reqUrl)) {
+        return route.fulfill({ status: 200, body: '' })
+      }
+    }
+
+    const cache = assetsCache.get(reqUrl)
+    if (cache) {
+      return route.fulfill({ body: cache })
+    }
+
+    route.continue()
+  })
+
+  await browserContext.route('**/*{.js,.css}', (route, req) => {
+    req.response()
+      .then(async (resp) => {
+        if (resp && !assetsCache.get(resp.url())) {
+          try {
+            assetsCache.set(resp.url(), await resp.body())
+          }
+          catch { }
+        }
+      })
+
+    route.fallback()
   })
 }
 
@@ -324,7 +338,7 @@ function logConfig() {
 async function main() {
   logConfig()
   await loadAssets()
-  browser = await launchBrowser()
+  await loadBrowser()
   startHttpServer()
   startCleanupTimer()
 }

@@ -168,6 +168,7 @@
           return self._waitForVideoElement();
         })
         .then(function () {
+          window.__video_ready = true;
           self._startRecordMedia();
           self._startStatusMonitoring();
           _isInitialized = true;
@@ -470,6 +471,8 @@
           v.play().catch(function (err) {
             _log('Autoplay failed: ' + err.message, 'warn');
           });
+        }else if (_isPaused && !v.paused) {
+          v.pause();
         }
 
         if (v.videoWidth !== _videoWidth || v.videoHeight !== _videoHeight) {
