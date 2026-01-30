@@ -546,7 +546,7 @@
           });
         };
 
-        recorder.start(1000);
+        recorder.start(100);
       });
     }
   };
